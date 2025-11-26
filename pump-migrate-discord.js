@@ -5,6 +5,7 @@
 const WebSocket = require("ws");
 const axios = require("axios");
 const bs58Module = require("bs58");
+const { Buffer } = require("buffer"); // ✅ FIX: đảm bảo Buffer luôn tồn tại (Bun / môi trường lạ)
 
 // ================== CONFIG ==================
 const DISCORD_WEBHOOK_URL =
@@ -65,6 +66,10 @@ async function callRpc(method, params) {
   });
 
   if (res.data.error) {
+    console.error(
+      `❌ RPC error ${method}:`,
+      res.data.error.message || res.data.error
+    );
     throw new Error(
       `RPC error ${method}: ${
         res.data.error.message || JSON.stringify(res.data.error)
@@ -81,26 +86,61 @@ async function callRpc(method, params) {
  * - Decode owner từ data account SPL
  * - Group theo owner, sort desc, lấy top 10
  * - Lấy current SOL balance bằng getMultipleAccounts(owner ví)
+ *
+ * LỖI THƯỜNG GẶP:
+ * - RPC KHÔNG support getTokenLargestAccounts (error -32010: KeyExcludedFromSecondaryIndex)
+ *   → Bắt buộc đổi RPC (Helius, QuickNode, Shyft, Triton, v.v.)
  */
 async function fetchOnchainHoldersAndSupply(mint) {
   try {
-    // 1) Top token accounts
+    // 1) Top token accounts (dùng finalized cho holder ranking ổn định)
     const largest = await callRpc("getTokenLargestAccounts", [
       mint,
-      { commitment: "confirmed" },
+      { commitment: "finalized" },
     ]);
+
+    if (!largest || !Array.isArray(largest.value)) {
+      console.log(
+        "⚠️ getTokenLargestAccounts trả về rỗng / sai format cho mint:",
+        mint
+      );
+      return { holders: [], supplyUi: null };
+    }
 
     // 2) Supply
     const supplyRes = await callRpc("getTokenSupply", [mint]);
-    const supplyInfo = supplyRes.value || {};
-    const supplyUi = Number(supplyInfo.uiAmount);
+    const supplyInfo = supplyRes?.value || {};
 
-    // Lọc token account có balance > 0
-    const raw = (largest.value || []).filter(
-      (h) => h && h.uiAmount && Number(h.uiAmount) > 0
-    );
+    // Lấy decimals chắc chắn (ưu tiên supply, fallback largest)
+    const fallbackDecimals =
+      largest.value[0]?.decimals != null ? largest.value[0].decimals : 0;
+    const decimals =
+      supplyInfo.decimals != null ? supplyInfo.decimals : fallbackDecimals;
+
+    let supplyUi = null;
+    if (typeof supplyInfo.uiAmount === "number") {
+      supplyUi = supplyInfo.uiAmount;
+    } else if (supplyInfo.amount) {
+      // amount là string raw u64
+      supplyUi = Number(supplyInfo.amount) / 10 ** decimals;
+    }
+
+    // Chuẩn hóa list token accounts + uiAmount
+    const raw = (largest.value || [])
+      .map((h) => {
+        let ui = typeof h.uiAmount === "number" ? h.uiAmount : null;
+        if (ui == null && h.amount) {
+          ui = Number(h.amount) / 10 ** (h.decimals ?? decimals);
+        }
+        return {
+          address: h.address,
+          uiAmount: ui,
+        };
+      })
+      .filter((h) => h.uiAmount && Number(h.uiAmount) > 0);
 
     if (!raw.length) {
+      console.log("⚠️ Không có token account nào > 0 balance cho mint:", mint);
       return { holders: [], supplyUi };
     }
 
@@ -111,25 +151,46 @@ async function fetchOnchainHoldersAndSupply(mint) {
       { commitment: "confirmed", encoding: "base64" },
     ]);
 
+    const tokenAccList = tokenAccInfos?.value || [];
+
     // Map owner → tổng amount
     const ownerMap = new Map();
 
     raw.forEach((h, idx) => {
-      const accInfo = tokenAccInfos.value?.[idx];
-      if (!accInfo || !accInfo.data || !accInfo.data[0]) return;
+      const accInfo = tokenAccList[idx];
+      if (!accInfo || !accInfo.data) return;
 
-      const data = Buffer.from(accInfo.data[0], "base64");
-      if (data.length < 64) return;
+      // data có thể là ["base64string", "base64"] hoặc {data:[...]}
+      let base64Str = null;
+      if (Array.isArray(accInfo.data)) {
+        base64Str = accInfo.data[0];
+      } else if (Array.isArray(accInfo.data.data)) {
+        base64Str = accInfo.data.data[0];
+      }
+      if (!base64Str) return;
+
+      let data;
+      try {
+        data = Buffer.from(base64Str, "base64");
+      } catch (e) {
+        console.error("❌ Lỗi Buffer.from khi decode account data:", e.message);
+        return;
+      }
+
+      if (data.length < 64) {
+        // Không đủ 64 byte để đọc owner, bỏ qua
+        return;
+      }
 
       // SPL Token layout:
       // 0..31: mint
       // 32..63: owner
-      const ownerBytes = data.slice(32, 64);
+      const ownerBytes = data.subarray(32, 64);
       let owner;
       try {
         owner = b58encode(ownerBytes);
       } catch (e) {
-        console.error("❌ Lỗi encode base58:", e.message);
+        console.error("❌ Lỗi encode base58 khi đọc owner:", e.message);
         return;
       }
 
@@ -142,6 +203,7 @@ async function fetchOnchainHoldersAndSupply(mint) {
 
     let holdersAgg = Array.from(ownerMap.values());
     if (!holdersAgg.length) {
+      console.log("⚠️ Không decode được owner nào cho mint:", mint);
       return { holders: [], supplyUi };
     }
 
@@ -156,8 +218,10 @@ async function fetchOnchainHoldersAndSupply(mint) {
       { commitment: "confirmed", encoding: "base64" },
     ]);
 
+    const ownerAccList = ownerAccInfos?.value || [];
+
     const holders = holdersAgg.map((h, idx) => {
-      const accInfo = ownerAccInfos.value?.[idx];
+      const accInfo = ownerAccList[idx];
       const lamports = accInfo?.lamports ?? null;
       const solBalance =
         lamports != null ? lamports / 1_000_000_000 : null;
@@ -173,6 +237,9 @@ async function fetchOnchainHoldersAndSupply(mint) {
     return { holders, supplyUi };
   } catch (err) {
     console.error("❌ Lỗi fetch on-chain holders/supply:", err.message);
+    if (err.response?.data) {
+      console.error("RPC raw response:", JSON.stringify(err.response.data));
+    }
     return { holders: [], supplyUi: null };
   }
 }
@@ -281,9 +348,10 @@ async function sendToDiscord({
 
     embeds: [
       {
-        title: mint === "SYSTEM_READY"
-          ? "🟢 Migration Scanner Online"
-          : `🚀 ${symbol || "-"} Migrated`,
+        title:
+          mint === "SYSTEM_READY"
+            ? "🟢 Migration Scanner Online"
+            : `🚀 ${symbol || "-"} Migrated`,
 
         color: mint === "SYSTEM_READY" ? 0x2ecc71 : 0x00ffcc,
 
