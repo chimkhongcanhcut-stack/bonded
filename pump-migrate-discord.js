@@ -13,13 +13,17 @@ const DISCORD_WEBHOOK_URL =
 
 const WS_URL = "wss://pumpportal.fun/api/data";
 // Nên dùng RPC riêng (Helius, Triton, v.v.)
-const RPC_URL = "https://mainnet.helius-rpc.com/?api-key=2504db9f-75d5-4f46-a6da-c4b30f1345b9";
+const RPC_URL =
+  "https://mainnet.helius-rpc.com/?api-key=2504db9f-75d5-4f46-a6da-c4b30f1345b9";
 
 const RECONNECT_DELAY_MS = 5000;
 const DEDUPE_TTL_MS = 5 * 60 * 1000; // 5 phút chống spam
 // ============================================
 
 const lastNotifiedByMint = new Map();
+
+// ✅ Cache metadata Pump.fun để đỡ call lại nhiều lần
+const pumpMetaCache = new Map();
 
 // ================== HELPERS ==================
 function shorten(addr) {
@@ -77,6 +81,67 @@ async function callRpc(method, params) {
     );
   }
   return res.data.result;
+}
+
+// ================== PUMP.FUN METADATA ==================
+/**
+ * Lấy metadata (name, symbol) từ Pump.fun frontend API theo mint
+ * Chỉ gọi khi:
+ * - Có mint
+ * - name hiện tại rỗng / "-" / trùng symbol (tức là vô nghĩa)
+ */
+async function fetchPumpMetadata(mint, currentName, currentSymbol) {
+  if (!mint) {
+    return { name: currentName || currentSymbol || "-", symbol: currentSymbol || "-" };
+  }
+
+  // Nếu name đã ổn rồi thì khỏi gọi API
+  if (
+    currentName &&
+    currentName !== "-" &&
+    currentName.toUpperCase() !== (currentSymbol || "").toUpperCase()
+  ) {
+    return { name: currentName, symbol: currentSymbol || "-" };
+  }
+
+  // Check cache
+  if (pumpMetaCache.has(mint)) {
+    const cached = pumpMetaCache.get(mint);
+    return {
+      name: cached.name || currentName || currentSymbol || "-",
+      symbol: cached.symbol || currentSymbol || "-",
+    };
+  }
+
+  try {
+    const url = `https://frontend-api.pump.fun/coins/${mint}`;
+    const res = await axios.get(url, { timeout: 5000 });
+    const data = res.data || {};
+
+    const name =
+      data.name ||
+      data.tokenName ||
+      currentName ||
+      currentSymbol ||
+      "-";
+
+    const symbol =
+      data.symbol ||
+      data.ticker ||
+      data.tokenSymbol ||
+      currentSymbol ||
+      "-";
+
+    pumpMetaCache.set(mint, { name, symbol });
+
+    return { name, symbol };
+  } catch (e) {
+    console.error("❌ Pump.fun metadata error:", e.message);
+    return {
+      name: currentName || currentSymbol || "-",
+      symbol: currentSymbol || "-",
+    };
+  }
 }
 
 // ================= FETCH HOLDERS + SUPPLY =================
@@ -223,8 +288,7 @@ async function fetchOnchainHoldersAndSupply(mint) {
     const holders = holdersAgg.map((h, idx) => {
       const accInfo = ownerAccList[idx];
       const lamports = accInfo?.lamports ?? null;
-      const solBalance =
-        lamports != null ? lamports / 1_000_000_000 : null;
+      const solBalance = lamports != null ? lamports / 1_000_000_000 : null;
 
       return {
         rank: idx + 1,
@@ -309,9 +373,7 @@ async function sendToDiscord({
             ? `${amtStrBase} tokens (liquidity pool)`
             : `${amtStrBase} tokens`;
         const solStr =
-          h.solBalance != null
-            ? `${h.solBalance.toFixed(3)} SOL`
-            : "N/A";
+          h.solBalance != null ? `${h.solBalance.toFixed(3)} SOL` : "N/A";
         return `▫️ **#${h.rank}** — [${addrShort}](https://solscan.io/account/${h.address}) • **${amtStr}** • 💰 ${solStr}`;
       })
       .join("\n");
@@ -329,10 +391,8 @@ async function sendToDiscord({
     ? supplyUi.toLocaleString("en-US", { maximumFractionDigits: 2 })
     : "No Data";
 
-  const top1Str =
-    top1Pct != null ? `${top1Pct.toFixed(2)}%` : "N/A";
-  const top10Str =
-    top10Pct != null ? `${top10Pct.toFixed(2)}%` : "N/A";
+  const top1Str = top1Pct != null ? `${top1Pct.toFixed(2)}%` : "N/A";
+  const top10Str = top10Pct != null ? `${top10Pct.toFixed(2)}%` : "N/A";
 
   const content = pingEveryone
     ? "@everyone 🚨 **New Pump.fun Migration Detected!**"
@@ -340,9 +400,7 @@ async function sendToDiscord({
 
   const body = {
     content,
-    allowed_mentions: pingEveryone
-      ? { parse: ["everyone"] }
-      : { parse: [] },
+    allowed_mentions: pingEveryone ? { parse: ["everyone"] } : { parse: [] },
 
     username: "Migration Scanner",
 
@@ -414,13 +472,10 @@ async function handleEvent(msg) {
     const token = msg?.token || msg?.data?.token || msg;
 
     const mint =
-      token?.mint ||
-      token?.mintAddress ||
-      token?.address ||
-      msg?.mint;
+      token?.mint || token?.mintAddress || token?.address || msg?.mint;
     if (!mint) return;
 
-    const symbol =
+    let symbol =
       token?.symbol ||
       token?.ticker ||
       token?.tokenSymbol ||
@@ -428,13 +483,18 @@ async function handleEvent(msg) {
       msg?.ticker ||
       "-";
 
-    const name =
+    let name =
       token?.name ||
       token?.tokenName ||
       token?.coin_name ||
       msg?.name ||
       symbol ||
       "-";
+
+    // ✅ Bổ sung: nếu name/symbol tệ → gọi Pump.fun API để lấy metadata chuẩn
+    const meta = await fetchPumpMetadata(mint, name, symbol);
+    name = meta.name;
+    symbol = meta.symbol;
 
     // chống spam cùng CA
     const now = Date.now();
