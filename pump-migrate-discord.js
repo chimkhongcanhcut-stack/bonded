@@ -1,28 +1,28 @@
 // pump-migrate-discord.js
 // Analytics bot: nghe Pump.fun migration → phân tích top holders (owner wallet, bỏ LP khỏi %)
-// Gửi Discord embed đẹp + @everyone + link Solscan + Axiom (paste CA để trade)
+// Gửi Discord embed đẹp + @everyone + link Solscan + Axiom
 
 const WebSocket = require("ws");
 const axios = require("axios");
 const bs58Module = require("bs58");
-const { Buffer } = require("buffer"); // ✅ FIX: đảm bảo Buffer luôn tồn tại (Bun / môi trường lạ)
+const { Buffer } = require("buffer");
 
 // ================== CONFIG ==================
 const DISCORD_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1441130174316937236/jB1R900aKhkvLRxHunSqQn8bPx_o5jSpMtW6x-Xj6te8M4AJewfjvTUbJnLyNGiNCPRE";
 
 const WS_URL = "wss://pumpportal.fun/api/data";
+
 // Nên dùng RPC riêng (Helius, Triton, v.v.)
 const RPC_URL =
   "https://mainnet.helius-rpc.com/?api-key=2504db9f-75d5-4f46-a6da-c4b30f1345b9";
 
 const RECONNECT_DELAY_MS = 5000;
 const DEDUPE_TTL_MS = 5 * 60 * 1000; // 5 phút chống spam
-// ============================================
 
 const lastNotifiedByMint = new Map();
 
-// ✅ Cache metadata Pump.fun để đỡ call lại nhiều lần
+// ✅ Cache metadata để đỡ call lại nhiều
 const pumpMetaCache = new Map();
 
 // ================== HELPERS ==================
@@ -83,19 +83,97 @@ async function callRpc(method, params) {
   return res.data.result;
 }
 
-// ================== PUMP.FUN METADATA ==================
+// ================== PUMP.FUN METADATA (PRIMARY) ==================
+async function fetchPumpfunMetadata(mint) {
+  try {
+    const url = "https://frontend-api-v3.pump.fun/coins/mints";
+    const res = await axios.post(
+      url,
+      { mints: [mint] },
+      { timeout: 5000 }
+    );
+
+    let data = null;
+    const d = res.data;
+
+    if (Array.isArray(d)) {
+      data = d[0];
+    } else if (d && typeof d === "object") {
+      data = d[mint] || d.coin || d;
+    }
+
+    if (!data) {
+      throw new Error("Empty Pump.fun metadata response");
+    }
+
+    const name =
+      data.name ||
+      data.tokenName ||
+      data.displayName ||
+      data.symbol ||
+      "-";
+
+    const symbol =
+      data.symbol ||
+      data.ticker ||
+      data.tokenSymbol ||
+      data.name ||
+      "-";
+
+    return { name, symbol };
+  } catch (e) {
+    const status = e.response?.status;
+    console.error(
+      "❌ Pump.fun metadata error:",
+      status ? `HTTP ${status}` : e.message
+    );
+    return null;
+  }
+}
+
+// ================== DEXSCREENER METADATA (FALLBACK) ==================
+async function fetchDexscreenerMetadata(mint) {
+  try {
+    const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
+    const res = await axios.get(url, { timeout: 5000 });
+    const data = res.data;
+
+    if (!data || !Array.isArray(data.pairs) || !data.pairs.length) {
+      throw new Error("Empty Dexscreener pairs");
+    }
+
+    // Lấy pair đầu tiên là đủ
+    const base = data.pairs[0]?.baseToken || {};
+    const name = base.name || base.symbol || "-";
+    const symbol = base.symbol || base.name || "-";
+
+    return { name, symbol };
+  } catch (e) {
+    const status = e.response?.status;
+    console.error(
+      "❌ Dexscreener metadata error:",
+      status ? `HTTP ${status}` : e.message
+    );
+    return null;
+  }
+}
+
+// ================== METADATA COORDINATOR ==================
 /**
- * Lấy metadata (name, symbol) từ Pump.fun frontend API theo mint
- * Chỉ gọi khi:
- * - Có mint
- * - name hiện tại rỗng / "-" / trùng symbol (tức là vô nghĩa)
+ * Ưu tiên:
+ *  1. Data từ Pump.fun v3
+ *  2. Fallback Dexscreener
+ *  3. Fallback currentName/currentSymbol
  */
-async function fetchPumpMetadata(mint, currentName, currentSymbol) {
+async function fetchTokenMetadata(mint, currentName, currentSymbol) {
   if (!mint) {
-    return { name: currentName || currentSymbol || "-", symbol: currentSymbol || "-" };
+    return {
+      name: currentName || currentSymbol || "-",
+      symbol: currentSymbol || "-",
+    };
   }
 
-  // Nếu name đã ổn rồi thì khỏi gọi API
+  // Nếu name hiện tại đã ngon thì thôi khỏi gọi API
   if (
     currentName &&
     currentName !== "-" &&
@@ -104,7 +182,7 @@ async function fetchPumpMetadata(mint, currentName, currentSymbol) {
     return { name: currentName, symbol: currentSymbol || "-" };
   }
 
-  // Check cache
+  // Cache
   if (pumpMetaCache.has(mint)) {
     const cached = pumpMetaCache.get(mint);
     return {
@@ -113,52 +191,38 @@ async function fetchPumpMetadata(mint, currentName, currentSymbol) {
     };
   }
 
-  try {
-    const url = `https://frontend-api.pump.fun/coins/${mint}`;
-    const res = await axios.get(url, { timeout: 5000 });
-    const data = res.data || {};
+  // 1) Thử Pump.fun v3
+  let meta = await fetchPumpfunMetadata(mint);
 
-    const name =
-      data.name ||
-      data.tokenName ||
-      currentName ||
-      currentSymbol ||
-      "-";
+  // 2) Nếu fail hoặc name/symbol vẫn tệ → fallback Dexscreener
+  const badMeta =
+    !meta ||
+    !meta.name ||
+    meta.name === "-" ||
+    meta.symbol === "-" ||
+    meta.name.toUpperCase() === meta.symbol.toUpperCase();
 
-    const symbol =
-      data.symbol ||
-      data.ticker ||
-      data.tokenSymbol ||
-      currentSymbol ||
-      "-";
-
-    pumpMetaCache.set(mint, { name, symbol });
-
-    return { name, symbol };
-  } catch (e) {
-    console.error("❌ Pump.fun metadata error:", e.message);
-    return {
-      name: currentName || currentSymbol || "-",
-      symbol: currentSymbol || "-",
-    };
+  if (badMeta) {
+    const dexMeta = await fetchDexscreenerMetadata(mint);
+    if (dexMeta) {
+      meta = dexMeta;
+    }
   }
+
+  // 3) Nếu vẫn không có thì fallback về current
+  const name =
+    meta?.name || currentName || currentSymbol || "-";
+  const symbol =
+    meta?.symbol || currentSymbol || currentName || "-";
+
+  pumpMetaCache.set(mint, { name, symbol });
+
+  return { name, symbol };
 }
 
 // ================= FETCH HOLDERS + SUPPLY =================
-/**
- * Lấy top holders theo ví owner:
- * - Dùng getTokenLargestAccounts → token accounts
- * - Decode owner từ data account SPL
- * - Group theo owner, sort desc, lấy top 10
- * - Lấy current SOL balance bằng getMultipleAccounts(owner ví)
- *
- * LỖI THƯỜNG GẶP:
- * - RPC KHÔNG support getTokenLargestAccounts (error -32010: KeyExcludedFromSecondaryIndex)
- *   → Bắt buộc đổi RPC (Helius, QuickNode, Shyft, Triton, v.v.)
- */
 async function fetchOnchainHoldersAndSupply(mint) {
   try {
-    // 1) Top token accounts (dùng finalized cho holder ranking ổn định)
     const largest = await callRpc("getTokenLargestAccounts", [
       mint,
       { commitment: "finalized" },
@@ -172,11 +236,9 @@ async function fetchOnchainHoldersAndSupply(mint) {
       return { holders: [], supplyUi: null };
     }
 
-    // 2) Supply
     const supplyRes = await callRpc("getTokenSupply", [mint]);
     const supplyInfo = supplyRes?.value || {};
 
-    // Lấy decimals chắc chắn (ưu tiên supply, fallback largest)
     const fallbackDecimals =
       largest.value[0]?.decimals != null ? largest.value[0].decimals : 0;
     const decimals =
@@ -186,11 +248,9 @@ async function fetchOnchainHoldersAndSupply(mint) {
     if (typeof supplyInfo.uiAmount === "number") {
       supplyUi = supplyInfo.uiAmount;
     } else if (supplyInfo.amount) {
-      // amount là string raw u64
       supplyUi = Number(supplyInfo.amount) / 10 ** decimals;
     }
 
-    // Chuẩn hóa list token accounts + uiAmount
     const raw = (largest.value || [])
       .map((h) => {
         let ui = typeof h.uiAmount === "number" ? h.uiAmount : null;
@@ -209,7 +269,6 @@ async function fetchOnchainHoldersAndSupply(mint) {
       return { holders: [], supplyUi };
     }
 
-    // 3) Lấy token account info để đọc owner
     const tokenAccountAddresses = raw.map((h) => h.address);
     const tokenAccInfos = await callRpc("getMultipleAccounts", [
       tokenAccountAddresses,
@@ -218,14 +277,12 @@ async function fetchOnchainHoldersAndSupply(mint) {
 
     const tokenAccList = tokenAccInfos?.value || [];
 
-    // Map owner → tổng amount
     const ownerMap = new Map();
 
     raw.forEach((h, idx) => {
       const accInfo = tokenAccList[idx];
       if (!accInfo || !accInfo.data) return;
 
-      // data có thể là ["base64string", "base64"] hoặc {data:[...]}
       let base64Str = null;
       if (Array.isArray(accInfo.data)) {
         base64Str = accInfo.data[0];
@@ -242,14 +299,8 @@ async function fetchOnchainHoldersAndSupply(mint) {
         return;
       }
 
-      if (data.length < 64) {
-        // Không đủ 64 byte để đọc owner, bỏ qua
-        return;
-      }
+      if (data.length < 64) return;
 
-      // SPL Token layout:
-      // 0..31: mint
-      // 32..63: owner
       const ownerBytes = data.subarray(32, 64);
       let owner;
       try {
@@ -272,11 +323,9 @@ async function fetchOnchainHoldersAndSupply(mint) {
       return { holders: [], supplyUi };
     }
 
-    // 4) Sort desc theo amount, lấy top 10 owner
     holdersAgg.sort((a, b) => b.amountUi - a.amountUi);
     holdersAgg = holdersAgg.slice(0, 10);
 
-    // 5) Lấy current SOL balance của ví owner
     const ownerAddresses = holdersAgg.map((h) => h.address);
     const ownerAccInfos = await callRpc("getMultipleAccounts", [
       ownerAddresses,
@@ -308,23 +357,18 @@ async function fetchOnchainHoldersAndSupply(mint) {
   }
 }
 
-// ================== ANALYTICS (REMOVE LP FOR % CALC) ==================
-/**
- * Tính % top1 / top10 nhưng BỎ LP (giả định holder #1 là LP)
- * - top1Pct = ví giàu nhất không phải LP (holders[1])
- * - top10Pct = sum 10 ví đầu tiên sau khi bỏ LP (holders.slice(1, 11))
- */
+// ================== ANALYTICS (BỎ LP NHƯNG KHÔNG GHI TEXT) ==================
 function analyzeConcentrationExcludingLp(holders, supplyUi) {
   if (!holders.length || !supplyUi || supplyUi <= 0) {
-    return { top1Pct: null, top10Pct: null, risk: "⚠️ No Data" };
+    return { top1Pct: null, top10Pct: null, risk: "⚠️ No data" };
   }
 
-  const nonLp = holders.slice(1); // bỏ LP
+  const nonLp = holders.slice(1); // vẫn bỏ LP nhưng không ghi (ex-LP)
   if (!nonLp.length) {
     return {
       top1Pct: null,
       top10Pct: null,
-      risk: "⚠️ Only LP exists, no holder data",
+      risk: "⚠️ Only LP account, no holder data",
     };
   }
 
@@ -336,21 +380,17 @@ function analyzeConcentrationExcludingLp(holders, supplyUi) {
   const top1Pct = (top1 / supplyUi) * 100;
   const top10Pct = (top10 / supplyUi) * 100;
 
-  let risk = "🟢 Balanced (LP excluded)";
+  let risk = "🟢 Balanced";
   if (top1Pct > 40 || top10Pct > 90) {
-    risk = "☠️ High whale risk (LP excluded)";
+    risk = "☠️ High whale risk";
   } else if (top1Pct > 20 || top10Pct > 75) {
-    risk = "⚠️ Concentrated (LP excluded)";
+    risk = "⚠️ Concentrated";
   }
 
   return { top1Pct, top10Pct, risk };
 }
 
 // ================= SEND TO DISCORD ==================
-/**
- * pingEveryone = true  → @everyone
- * pingEveryone = false → không ping (dùng cho startup)
- */
 async function sendToDiscord({
   name,
   symbol,
@@ -368,10 +408,7 @@ async function sendToDiscord({
       .map((h) => {
         const addrShort = shorten(h.address);
         const amtStrBase = formatTokenAmountCompact(h.amountUi);
-        const amtStr =
-          h.rank === 1
-            ? `${amtStrBase} tokens (liquidity pool)`
-            : `${amtStrBase} tokens`;
+        const amtStr = `${amtStrBase} tokens`;
         const solStr =
           h.solBalance != null ? `${h.solBalance.toFixed(3)} SOL` : "N/A";
         return `▫️ **#${h.rank}** — [${addrShort}](https://solscan.io/account/${h.address}) • **${amtStr}** • 💰 ${solStr}`;
@@ -435,12 +472,12 @@ async function sendToDiscord({
                   inline: true,
                 },
                 {
-                  name: "🐋 Top 1 Holder (ex-LP)",
+                  name: "🐋 Top 1 Holder",
                   value: top1Str,
                   inline: true,
                 },
                 {
-                  name: "👥 Top 10 Holders (ex-LP)",
+                  name: "👥 Top 10 Holders",
                   value: top10Str,
                   inline: true,
                 },
@@ -491,12 +528,11 @@ async function handleEvent(msg) {
       symbol ||
       "-";
 
-    // ✅ Bổ sung: nếu name/symbol tệ → gọi Pump.fun API để lấy metadata chuẩn
-    const meta = await fetchPumpMetadata(mint, name, symbol);
+    // Lấy metadata chuẩn (Pump.fun v3 + fallback Dexscreener)
+    const meta = await fetchTokenMetadata(mint, name, symbol);
     name = meta.name;
     symbol = meta.symbol;
 
-    // chống spam cùng CA
     const now = Date.now();
     if (
       lastNotifiedByMint.has(mint) &&
@@ -512,7 +548,7 @@ async function handleEvent(msg) {
     console.log("Tên   :", name);
     console.log("Ticker:", symbol);
     console.log("Mint  :", mint);
-    console.log("Đang fetch holders + supply (owner-based, ex-LP)...");
+    console.log("Đang fetch holders + supply (owner-based)...");
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     const { holders, supplyUi } = await fetchOnchainHoldersAndSupply(mint);
@@ -578,7 +614,6 @@ function startWebSocket() {
 }
 
 // ================== STARTUP PING ==================
-// Ping lên Discord (KHÔNG @everyone) khi bot khởi động
 sendToDiscord({
   name: "Bot đã khởi động",
   symbol: "READY",
