@@ -399,7 +399,7 @@ async function sendToDiscord({
   supplyUi,
   pingEveryone = true,
 }) {
-  const axiomLink = `https://axiom.trade/discover?chain=sol`;
+  const axiomLink = `https://axiom.trade/t/${mint}`;
   const solscan = `https://solscan.io/token/${mint}`;
 
   let holdersText = "No holder data";
@@ -625,3 +625,4 @@ sendToDiscord({
 
 // ================== RUN ==================
 startWebSocket();
+
