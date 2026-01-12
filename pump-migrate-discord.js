@@ -9,13 +9,12 @@ const { Buffer } = require("buffer");
 
 // ================== CONFIG ==================
 const DISCORD_WEBHOOK_URL =
-  "https://discord.com/api/webhooks/1441130174316937236/jB1R900aKhkvLRxHunSqQn8bPx_o5jSpMtW6x-Xj6te8M4AJewfjvTUbJnLyNGiNCPRE";
 
-const WS_URL = "wss://pumpportal.fun/api/data";
+
+const WS_URL = 
 
 // Nên dùng RPC riêng (Helius, Triton, v.v.)
 const RPC_URL =
-  "https://mainnet.helius-rpc.com/?api-key=2504db9f-75d5-4f46-a6da-c4b30f1345b9";
 
 const RECONNECT_DELAY_MS = 5000;
 const DEDUPE_TTL_MS = 5 * 60 * 1000; // 5 phút chống spam
@@ -625,4 +624,5 @@ sendToDiscord({
 
 // ================== RUN ==================
 startWebSocket();
+
 
